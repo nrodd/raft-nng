@@ -22,19 +22,29 @@ int main(int argc, char **argv)
     nng_socket sock;
     int rv;
 
+    // Initialize NNG library
+    if ((rv = nng_init(NULL)) != 0)
+        fatal("nng_init", rv);
+
     // Open a Pair socket
     if ((rv = nng_pair0_open(&sock)) != 0)
         fatal("nng_pair0_open", rv);
 
     if (std::string(mode) == "listen")
     {
-        if ((rv = nng_listen(sock, url, NULL, 0)) != 0)
-            fatal("nng_listen", rv);
+        nng_listener listener;
+        if ((rv = nng_listener_create(&listener, sock, url)) != 0)
+            fatal("nng_listener_create", rv);
+        if ((rv = nng_listener_start(listener, 0)) != 0)
+            fatal("nng_listener_start", rv);
     }
     else
     {
-        if ((rv = nng_dial(sock, url, NULL, 0)) != 0)
-            fatal("nng_dial", rv);
+        nng_dialer dialer;
+        if ((rv = nng_dialer_create(&dialer, sock, url)) != 0)
+            fatal("nng_dialer_create", rv);
+        if ((rv = nng_dialer_start(dialer, 0)) != 0)
+            fatal("nng_dialer_start", rv);
     }
 
     std::cout << "Socket ready in " << mode << " mode at " << url << std::endl;
