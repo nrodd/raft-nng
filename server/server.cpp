@@ -27,21 +27,23 @@ enum StateType
 // we can probaby combine(prevLogIndex, prevLogTerm) with (lastLogIndex, lastLogTerm)
 struct RPCMessage
 {
-    int type;                      // 0 for append_entries, 1 for request_vote
-    int term;                      // append_entries and request_vote
-    std::string leaderId;          // append_entries
-    int prevLogIndex;              // append_entries
-    int prevLogTerm;               // append_entries
-    std::vector<LogEntry> entries; // append_entries
-    int leaderCommit;              // append_entries
-    std::string candidateId;       // request_vote
-    int lastLogIndex;              // request_vote
-    int lastLogTerm;               // request_vote
+    int type;                           // 0 for append_entries, 1 for request_vote, 2 for client request
+    int term;                           // append_entries and request_vote
+    std::string leaderId;               // append_entries
+    int prevLogIndex;                   // append_entries
+    int prevLogTerm;                    // append_entries
+    std::vector<LogEntry> entries;      // append_entries
+    int leaderCommit;                   // append_entries
+    std::string candidateId;            // request_vote
+    int lastLogIndex;                   // request_vote
+    int lastLogTerm;                    // request_vote
+    std::string client_request_command; // client_request
 };
 
 // we can probably combine success and voteGranted
 struct RPCMessageResponse
 {
+    int error;        // append_entries and request_vote
     int term;         // append_entries and request_vote
     bool success;     // append_entries
     bool voteGranted; // request_vote
@@ -57,11 +59,13 @@ class Server
 {
 public:
     int currentTerm = 0;                // persistent
-    std::string votedFor;               // persistent
+    std::string votedFor = "";          // persistent
     std::vector<LogEntry> logs;         // persistent log[0] -> (term_received, command)
     std::vector<std::string> neighbors; // persistent on the application level?
     int commitIndex = 0;                // volatile
     int lastApplied = 0;                // volatile
+
+    std::string id = "0.0.0.0";
 
     // state stuff
     StateType state = FOLLOWER;
@@ -72,19 +76,21 @@ public:
     bool applied = false;
     std::mutex applied_mutex;
 
-    void send_message(nng_socket sock, RPCMessage msg)
+    RPCMessageResponse send_message(nng_socket sock, RPCMessage msg)
     {
         // 1. send the message
         int data_size = sizeof(msg);
         int temp_response = nng_send(sock, &msg, data_size, 0);
 
+        RPCMessageResponse response_data;
         if (temp_response != 0)
         {
             // handle error
+            response_data.error = 1;
+            return response_data;
         }
 
         // 2. handle the response
-        RPCMessageResponse response_data;
         size_t response_data_size = sizeof(response_data);
 
         temp_response = nng_recv(sock, &response_data, &response_data_size, 0);
@@ -92,12 +98,15 @@ public:
         if (temp_response == -1)
         {
             // handle error
+            response_data.error = 1;
+            return response_data;
         }
 
         if (temp_response == sizeof(response_data))
         {
             std::cout << "Received response for term:" << response_data.term << "\n";
-            // now actually process the data or whatever, prob need to return result to whatever function called it
+            // now actually process the data or whatever
+            return response_data;
         }
     }
 
@@ -122,15 +131,18 @@ public:
                     auto [term, truthy] = process_append_entries(incoming_data.term, incoming_data.leaderId, incoming_data.prevLogIndex, incoming_data.prevLogTerm, incoming_data.entries, incoming_data.leaderCommit);
                     reply_data.success = truthy;
                     reply_data.term = term;
-                    reply_data.voteGranted = false; // we dont actually need this
                 }
                 else if (incoming_data.type == 1)
                 {
                     // process request_vote
                     auto [term, truthy] = process_request_vote(incoming_data.term, incoming_data.candidateId, incoming_data.lastLogIndex, incoming_data.lastLogTerm);
-                    reply_data.success = true; // we dont actually need this
-                    reply_data.term = 50;
-                    reply_data.voteGranted = true;
+                    reply_data.voteGranted = truthy;
+                    reply_data.term = term;
+                }
+                else if (incoming_data.type == 2)
+                {
+                    // process client request
+                    process_client_request(incoming_data.client_request_command);
                 }
 
                 int reply_data_size = sizeof(reply_data);
@@ -151,12 +163,66 @@ public:
         }
     }
 
+    void process_client_request(std::string command)
+    {
+        if (state == FOLLOWER)
+        {
+            // followers can't handle client requests directly
+            // redirect client to the known leader
+            std::cout << "Not the leader, redirecting to leader" << "\n";
+            // you could store a currentLeaderId member variable to redirect to
+        }
+        else if (state == LEADER)
+        {
+            // 1. append entry to local log
+            LogEntry newEntry;
+            newEntry.termCommited = currentTerm;
+            newEntry.command = command;
+            logs.push_back(newEntry);
+
+            // 2. send append_entries to all followers
+            int prevLogIndex = logs.size() - 2; // index before new entry
+            int prevLogTerm = prevLogIndex >= 0 ? logs[prevLogIndex].termCommited : 0;
+            std::vector<LogEntry> newEntries = {newEntry};
+
+            int successCount = 1; // count self
+            for (int i = 0; i < neighbors.size(); i++)
+            {
+                bool success = append_entries(currentTerm, id, prevLogIndex, prevLogTerm, newEntries, commitIndex);
+                if (success)
+                {
+                    successCount++;
+                }
+            }
+
+            // 3. if majority acknowledged, commit the entry
+            if (successCount >= neighbors.size() / 2 + 1)
+            {
+                commitIndex = logs.size() - 1;
+                lastApplied = commitIndex;
+                std::cout << "Entry committed at index: " << commitIndex << "\n";
+            }
+        }
+        else if (state == CANDIDATE)
+        {
+            // in an election, reject client requests
+            std::cout << "In election, cannot process client request" << "\n";
+        }
+    }
+
     std::pair<int, bool> process_append_entries(int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
     {
         // set our applied var to true so that the follower doesnt time out
         applied_helper_function(true);
 
         // do we need to process hearbeats any differently?
+
+        // If AppendEntries RPC received from new leader: convert to follower
+        if (state == CANDIDATE)
+        {
+            // convert to follower
+            state = FOLLOWER;
+        }
 
         // 1. Reply false if term < currentTerm
         if (term < currentTerm)
@@ -239,6 +305,105 @@ public:
         applied_mutex.unlock();
     }
 
+    /*
+    invoked by leader to append logs or send hearbeat. called from client thread
+    and timer thread
+
+    args:
+
+
+    returns:
+
+
+    */
+    bool append_entries(int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
+    {
+        std::cout << "sending append_entries" << "\n";
+        RPCMessage receiver_msg;
+        receiver_msg.type = 0;
+        receiver_msg.term = term;
+        receiver_msg.leaderId = leaderId;
+        receiver_msg.prevLogIndex = prevLogIndex;
+        receiver_msg.prevLogTerm = prevLogTerm;
+        receiver_msg.entries = entries;
+        receiver_msg.leaderCommit = leaderCommit;
+
+        RPCMessageResponse receiver_response = send_message(sock, receiver_msg);
+        return receiver_response.success;
+    };
+
+    void convert_to_leader()
+    {
+        state = LEADER;
+        applied_helper_function(true); // so we dont timeout when were converted
+
+        // now i need to send append_entries heartbeat call right?
+        std::vector<LogEntry> empty_logs;
+        for (int i = 0; i < neighbors.size(); i++)
+        {
+            append_entries(currentTerm, id, lastApplied, logs[lastApplied].termCommited, empty_logs, commitIndex);
+        }
+    }
+
+    /*
+    invoked by candidate to gather votes
+
+    args:
+    int term -> candidates term
+    std::string candidateId -> candidate requesting vote
+    int lastLogIndex -> index of candidate's last log entry
+    int lastLogTerm -> term of candidate's last log entry
+
+    rets:
+    int term -> currentTerm, for candidate to update itself
+    bool voteGranted -> true means candidate received vote
+
+    */
+    bool request_vote(int term, std::string candidateId, int lastLogIndex, int lastLogTerm) // RPC
+    {
+        std::cout << "requesting vote" << "\n";
+        RPCMessage receiver_msg;
+        receiver_msg.type = 1;
+        receiver_msg.term = term;
+        receiver_msg.candidateId = id;
+        receiver_msg.lastLogIndex = lastLogIndex;
+        receiver_msg.lastLogTerm = lastLogTerm;
+        RPCMessageResponse receiver_response = send_message(sock, receiver_msg);
+        return receiver_response.voteGranted;
+    };
+
+    void start_election()
+    {
+        state = CANDIDATE;
+        votedFor = id;
+        currentTerm++;
+        // reset election timer
+
+        int votedForCount = 1; // vote for self i think
+        // will have to change this to run in parallel in future
+        for (int i = 0; i < neighbors.size(); i++)
+        {
+            // make request vote RPC call to each one
+            bool resp = request_vote(currentTerm, id, lastApplied, logs[lastApplied].termCommited);
+            if (resp == true)
+            {
+                votedForCount++;
+            }
+        }
+        if (votedForCount >= neighbors.size() / 2 + 1)
+        {
+            // this means we won the election, become leader
+            convert_to_leader();
+        }
+        else
+        {
+            // what do we do here if we dont become leader
+            // do we just let the election timeout?
+        }
+
+        // should we be discovering a new current leader iin the other thread, or should we process that from the request vote call?
+    }
+
     void timer_thread()
     {
         while (running)
@@ -249,9 +414,14 @@ public:
                 std::chrono::milliseconds leader_timeout(50);
                 std::this_thread::sleep_for(leader_timeout);
 
-                // now i need to send append_entries call right?
+                // now i need to send append_entries heartbeat call right?
+                std::vector<LogEntry> empty_logs;
+                for (int i = 0; i < neighbors.size(); i++)
+                {
+                    append_entries(currentTerm, id, lastApplied, logs[lastApplied].termCommited, empty_logs, commitIndex);
+                }
             }
-            else if (state == FOLLOWER)
+            else if (state == FOLLOWER || state == CANDIDATE)
             {
                 // need access to a timer variable with a mutex that I can update
                 // when receiving an RPC for append_entries
@@ -273,10 +443,14 @@ public:
                 if (applied == true)
                 {
                     // carry on as a follower
+                    break;
                 }
                 else
                 {
+                    std::cout << "Leader timed-out, starting election" << "\n";
                     // start an election
+                    start_election();
+                    break;
                 }
             }
         }
