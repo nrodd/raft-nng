@@ -27,16 +27,16 @@ enum StateType
 // we can probaby combine(prevLogIndex, prevLogTerm) with (lastLogIndex, lastLogTerm)
 struct RPCMessage
 {
-    int type;                         // 0 for append_entries, 1 for request_vote
-    int term;                         // append_entries and request_vote
-    std::string leaderId;             // append_entries
-    int prevLogIndex;                 // append_entries
-    int prevLogTerm;                  // append_entries
-    std::vector<std::string> entries; // append_entries
-    int leaderCommit;                 // append_entries
-    std::string candidateId;          // request_vote
-    int lastLogIndex;                 // request_vote
-    int lastLogTerm;                  // request_vote
+    int type;                      // 0 for append_entries, 1 for request_vote
+    int term;                      // append_entries and request_vote
+    std::string leaderId;          // append_entries
+    int prevLogIndex;              // append_entries
+    int prevLogTerm;               // append_entries
+    std::vector<LogEntry> entries; // append_entries
+    int leaderCommit;              // append_entries
+    std::string candidateId;       // request_vote
+    int lastLogIndex;              // request_vote
+    int lastLogTerm;               // request_vote
 };
 
 // we can probably combine success and voteGranted
@@ -126,7 +126,7 @@ public:
                 }
                 else if (incoming_data.type == 1)
                 {
-                    auto [term, truthy] = process_request_vote(incoming_data.term, incoming_data.candidateId, incoming_data.lastLogIndex, incoming_data.lastLogTerm);
+                    auto [term, truthy] = process_append_entries(incoming_data.term, incoming_data.leaderId, incoming_data.prevLogIndex, incoming_data.prevLogTerm, incoming_data.entries, incoming_data.leaderCommit
                     reply_data.success = false; // we dont actually need this
                     reply_data.term = term;
                     reply_data.voteGranted = truthy;
@@ -151,7 +151,7 @@ public:
         }
     }
 
-    std::pair<int, bool> process_append_entries(int term, int leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
+    std::pair<int, bool> process_append_entries(int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
     {
         // set our applied var to true so that the follower doesnt time out
         applied_helper_function(true);
