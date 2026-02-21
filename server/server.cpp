@@ -114,24 +114,24 @@ public:
             {
                 std::cout << "Incoming RPC type:" << incoming_data.type << "\n";
 
-                // process request_vote
                 RPCMessageResponse reply_data;
 
                 if (incoming_data.type == 0)
                 {
-                    auto [term, truthy] = process_request_vote(incoming_data.term, incoming_data.candidateId, incoming_data.lastLogIndex, incoming_data.lastLogTerm);
-                    reply_data.success = true;
-                    reply_data.term = 50;
-                    reply_data.voteGranted = true;
+                    // process append_entries
+                    auto [term, truthy] = process_append_entries(incoming_data.term, incoming_data.leaderId, incoming_data.prevLogIndex, incoming_data.prevLogTerm, incoming_data.entries, incoming_data.leaderCommit);
+                    reply_data.success = truthy;
+                    reply_data.term = term;
+                    reply_data.voteGranted = false; // we dont actually need this
                 }
                 else if (incoming_data.type == 1)
                 {
-                    auto [term, truthy] = process_append_entries(incoming_data.term, incoming_data.leaderId, incoming_data.prevLogIndex, incoming_data.prevLogTerm, incoming_data.entries, incoming_data.leaderCommit
-                    reply_data.success = false; // we dont actually need this
-                    reply_data.term = term;
-                    reply_data.voteGranted = truthy;
+                    // process request_vote
+                    auto [term, truthy] = process_request_vote(incoming_data.term, incoming_data.candidateId, incoming_data.lastLogIndex, incoming_data.lastLogTerm);
+                    reply_data.success = true; // we dont actually need this
+                    reply_data.term = 50;
+                    reply_data.voteGranted = true;
                 }
-                // process append_entries
 
                 int reply_data_size = sizeof(reply_data);
                 nng_send(sock, &reply_data, reply_data_size, 0); // should we be sending this on socket? how do we know which to send it to?
