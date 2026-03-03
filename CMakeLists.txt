@@ -5,8 +5,10 @@ project(MyPiProject)
 add_subdirectory(external/nng)
 
 # 2. Create your executable
-add_executable(my_app main.cpp)
+add_executable(my_app server/server.cpp)
+add_executable(test_nng messaging/simple_message.cpp)
 
 # 3. "Link" NNG to your app
 # This automatically handles both the .h files and the compiled library
 target_link_libraries(my_app nng)
+target_link_libraries(test_nng nng)

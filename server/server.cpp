@@ -24,6 +24,12 @@ enum StateType
     CANDIDATE
 };
 
+struct LogEntry
+{
+    int termCommited;
+    std::string command;
+};
+
 // we can probaby combine(prevLogIndex, prevLogTerm) with (lastLogIndex, lastLogTerm)
 struct RPCMessage
 {
@@ -49,12 +55,6 @@ struct RPCMessageResponse
     bool voteGranted; // request_vote
 };
 
-struct LogEntry
-{
-    int termCommited;
-    std::string command;
-};
-
 class Server
 {
 public:
@@ -65,7 +65,7 @@ public:
     int commitIndex = 0;                // volatile
     int lastApplied = 0;                // volatile
 
-    std::string id = "0.0.0.0";
+    std::string id = "tcp://127.0.0.1:5555";
 
     // state stuff
     StateType state = FOLLOWER;
@@ -75,6 +75,8 @@ public:
 
     bool applied = false;
     std::mutex applied_mutex;
+
+    nng_socket sock;
 
     RPCMessageResponse send_message(nng_socket sock, RPCMessage msg)
     {
@@ -108,6 +110,8 @@ public:
             // now actually process the data or whatever
             return response_data;
         }
+
+        return response_data;
     }
 
     void receive_message_thread(nng_socket sock)
@@ -266,6 +270,7 @@ public:
             int lastNewEntryIndex = prevLogIndex + (int)entries.size();
             commitIndex = std::min(leaderCommit, lastNewEntryIndex);
         }
+        return {currentTerm, true};
     };
 
     std::pair<int, bool> process_request_vote(int term, std::string candidateId, int lastLogIndex, int lastLogTerm) // RPC
@@ -296,6 +301,7 @@ public:
             votedFor = candidateId;
             return {currentTerm, true};
         }
+        return {currentTerm, false};
     };
 
     void applied_helper_function(bool val)
@@ -374,6 +380,8 @@ public:
 
     void start_election()
     {
+        std::cout << "Start Election called" << '\n';
+
         state = CANDIDATE;
         votedFor = id;
         currentTerm++;
@@ -383,13 +391,23 @@ public:
         // will have to change this to run in parallel in future
         for (int i = 0; i < neighbors.size(); i++)
         {
+            std::cout << "In loop" << '\n';
+
             // make request vote RPC call to each one
-            bool resp = request_vote(currentTerm, id, lastApplied, logs[lastApplied].termCommited);
+            std::cout << "Last Applied: " << lastApplied << '\n';
+            std::cout << "Current Term: " << currentTerm << '\n';
+            std::cout << "ID: " << id << '\n';
+            std::cout << "logs[lastApplied].termCommited: " << logs.empty() ? 0 : logs.back().termCommited << '\n';
+
+            bool resp = request_vote(currentTerm, id, lastApplied, logs.empty() ? 0 : logs.back().termCommited);
+            std::cout << "After request vote" << '\n';
             if (resp == true)
             {
                 votedForCount++;
             }
         }
+        std::cout << "Made it through loop" << '\n';
+
         if (votedForCount >= neighbors.size() / 2 + 1)
         {
             // this means we won the election, become leader
@@ -397,6 +415,8 @@ public:
         }
         else
         {
+            std::cout << "Weird Case" << '\n';
+
             // what do we do here if we dont become leader
             // do we just let the election timeout?
         }
@@ -432,6 +452,7 @@ public:
                 std::uniform_int_distribution<int> dist(150, 300);
                 int random_number = dist(gen);
                 std::chrono::milliseconds follower_timeout(random_number);
+                std::cout << "Random Number: " << random_number << '\n';
 
                 // set applied to be false
                 applied_helper_function(false);
@@ -457,13 +478,70 @@ public:
     }
 };
 
+void fatal(const char *func, int rv)
+{
+    std::cerr << func << ": " << nng_strerror((nng_err)rv) << std::endl;
+    exit(1);
+}
+
 int main()
 {
+
+    char *url = "tcp://127.0.0.1:5555";
+
     Server myServer;
-    myServer.votedFor = "yeet";
-    std::cout << myServer.votedFor << "\n";
-    myServer.sendMessage();
-    myServer.receiveMessage();
-    myServer.sendMessage();
+    myServer.id = url;
+
+    nng_socket sock;
+    int rv;
+
+    // Initialize NNG library
+    if ((rv = nng_init(NULL)) != 0)
+        fatal("nng_init", rv);
+
+    // Open a Pair socket
+    if ((rv = nng_bus0_open(&sock)) != 0)
+    {
+        std::cerr << "bus open failed: " << nng_strerror((nng_err)rv) << "\n";
+        return 1;
+    }
+
+    nng_listener listener;
+    if ((rv = nng_listener_create(&listener, sock, url)) != 0)
+        fatal("nng_listener_create", rv);
+    if ((rv = nng_listener_start(listener, 0)) != 0)
+        fatal("nng_listener_start", rv);
+
+    std::cout << "Socket ready at " << url << std::endl;
+
+    // set neighbors to the other servers' addresses
+    myServer.neighbors = {
+        "tcp://127.0.0.1:5001",
+        "tcp://127.0.0.1:5002",
+        "tcp://127.0.0.1:5003",
+        "tcp://127.0.0.1:5004"};
+    // remove self from neighbors
+    myServer.neighbors.erase(
+        std::remove(myServer.neighbors.begin(), myServer.neighbors.end(), url),
+        myServer.neighbors.end());
+
+    // dial each neighbor
+    for (auto &neighbor : myServer.neighbors)
+    {
+        if ((rv = nng_dial(sock, neighbor.c_str(), nullptr, NNG_FLAG_NONBLOCK)) != 0)
+        {
+            std::cerr << "Failed to dial " << neighbor << ": " << nng_strerror((nng_err)rv) << "\n";
+        }
+    }
+
+    myServer.sock = sock;
+    myServer.running = true;
+
+    std::thread recv_thread(&Server::receive_message_thread, &myServer, sock);
+    std::thread timer(&Server::timer_thread, &myServer);
+
+    recv_thread.join();
+    timer.join();
+
     return 0;
 }
