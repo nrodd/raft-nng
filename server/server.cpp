@@ -10,13 +10,6 @@
 
 // need to update persistent state to actually write to disk
 
-/*
-what does server need to do:
-
-- listen for incoming messages
-- send outbound messages (hmm, or should the state classes invoke these?)
-*/
-
 enum StateType
 {
     LEADER,
@@ -62,10 +55,10 @@ public:
     std::string votedFor = "";          // persistent
     std::vector<LogEntry> logs;         // persistent log[0] -> (term_received, command)
     std::vector<std::string> neighbors; // persistent on the application level?
-    int commitIndex = 0;                // volatile
-    int lastApplied = 0;                // volatile
+    int commitIndex = -1;               // volatile
+    int lastApplied = -1;               // volatile
 
-    std::string id = "tcp://127.0.0.1:5555";
+    std::string id = "";
 
     // state stuff
     StateType state = FOLLOWER;
@@ -78,39 +71,58 @@ public:
 
     nng_socket sock;
 
+    int get_last_log_index() const
+    {
+        return logs.empty() ? -1 : static_cast<int>(logs.size()) - 1;
+    }
+
+    int get_last_log_term() const
+    {
+        return logs.empty() ? 0 : logs.back().termCommited;
+    }
+
     RPCMessageResponse send_message(nng_socket sock, RPCMessage msg)
     {
-        // 1. send the message
-        int data_size = sizeof(msg);
-        int temp_response = nng_send(sock, &msg, data_size, 0);
+        RPCMessageResponse response_data{};
+        response_data.error = 0;
 
-        RPCMessageResponse response_data;
-        if (temp_response != 0)
+        constexpr int kMaxRetries = 2;
+        constexpr nng_duration kTimeoutMs = 100;
+
+        // Per-call timeout (can also be set once in main)
+        nng_socket_set_ms(sock, NNG_OPT_SENDTIMEO, kTimeoutMs);
+        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, kTimeoutMs);
+
+        for (int attempt = 0; attempt <= kMaxRetries; ++attempt)
         {
-            // handle error
-            response_data.error = 1;
+            size_t data_size = sizeof(msg);
+            int rv = nng_send(sock, &msg, data_size, 0);
+            if (rv != 0)
+            {
+                if (rv == NNG_ETIMEDOUT && attempt < kMaxRetries)
+                    continue;
+                response_data.error = rv;
+                return response_data;
+            }
+
+            size_t response_data_size = sizeof(response_data);
+            rv = nng_recv(sock, &response_data, &response_data_size, 0);
+
+            if (rv == 0 && response_data_size == sizeof(response_data))
+            {
+                return response_data; // success
+            }
+
+            if (rv == NNG_ETIMEDOUT && attempt < kMaxRetries)
+            {
+                continue; // retry same peer
+            }
+
+            response_data.error = (rv == 0) ? NNG_EINVAL : rv;
             return response_data;
         }
 
-        // 2. handle the response
-        size_t response_data_size = sizeof(response_data);
-
-        temp_response = nng_recv(sock, &response_data, &response_data_size, 0);
-
-        if (temp_response == -1)
-        {
-            // handle error
-            response_data.error = 1;
-            return response_data;
-        }
-
-        if (temp_response == sizeof(response_data))
-        {
-            std::cout << "Received response for term:" << response_data.term << "\n";
-            // now actually process the data or whatever
-            return response_data;
-        }
-
+        response_data.error = NNG_ETIMEDOUT;
         return response_data;
     }
 
@@ -235,10 +247,17 @@ public:
         }
 
         // 2. Reply false if log doesn’t contain an entry at prevLogIndex
-        // whose term matches prevLogTerm
-        if (logs[prevLogIndex].termCommited != prevLogTerm)
+        // whose term matches prevLogTerm. If prevLogIndex == -1, this check passes.
+        if (prevLogIndex >= 0)
         {
-            return {currentTerm, false};
+            if (prevLogIndex >= static_cast<int>(logs.size()))
+            {
+                return {currentTerm, false};
+            }
+            if (logs[prevLogIndex].termCommited != prevLogTerm)
+            {
+                return {currentTerm, false};
+            }
         }
 
         // 3. If an existing entry conflicts with a new one (same index
@@ -284,13 +303,13 @@ public:
         if (term > currentTerm)
         {
             currentTerm = term;
-            votedFor = -1;
+            votedFor = "";
             state = FOLLOWER;
         }
 
         // 2. Check if candidate log is at least as up-to-date as ours
-        int myLastLogIndex = logs.size() - 1;
-        int myLastLogTerm = logs.empty() ? 0 : logs.back().termCommited;
+        int myLastLogIndex = get_last_log_index();
+        int myLastLogTerm = get_last_log_term();
 
         bool logIsUpToDate = (lastLogTerm > myLastLogTerm) ||
                              (lastLogTerm == myLastLogTerm && lastLogIndex >= myLastLogIndex);
@@ -316,9 +335,15 @@ public:
     and timer thread
 
     args:
-
+    int term -> leader's term
+    std::string leaderId -> leader's id
+    int prevLogIndex -> index of leader's last log entry
+    int prevLogTerm -> term of leader's last log entry
+    std::vector<LogEntry> entries -> vector of log entries to append
+    int leaderCommit -> leader's commit index
 
     returns:
+    bool -> success status for candidate
 
 
     */
@@ -345,9 +370,11 @@ public:
 
         // now i need to send append_entries heartbeat call right?
         std::vector<LogEntry> empty_logs;
+        int prevLogIndex = get_last_log_index();
+        int prevLogTerm = get_last_log_term();
         for (int i = 0; i < neighbors.size(); i++)
         {
-            append_entries(currentTerm, id, lastApplied, logs[lastApplied].termCommited, empty_logs, commitIndex);
+            append_entries(currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
         }
     }
 
@@ -388,6 +415,8 @@ public:
         // reset election timer
 
         int votedForCount = 1; // vote for self i think
+        int lastLogIndex = get_last_log_index();
+        int lastLogTerm = get_last_log_term();
         // will have to change this to run in parallel in future
         for (int i = 0; i < neighbors.size(); i++)
         {
@@ -397,9 +426,9 @@ public:
             std::cout << "Last Applied: " << lastApplied << '\n';
             std::cout << "Current Term: " << currentTerm << '\n';
             std::cout << "ID: " << id << '\n';
-            std::cout << "logs[lastApplied].termCommited: " << logs.empty() ? 0 : logs.back().termCommited << '\n';
+            std::cout << "lastLogTerm: " << lastLogTerm << '\n';
 
-            bool resp = request_vote(currentTerm, id, lastApplied, logs.empty() ? 0 : logs.back().termCommited);
+            bool resp = request_vote(currentTerm, id, lastLogIndex, lastLogTerm);
             std::cout << "After request vote" << '\n';
             if (resp == true)
             {
@@ -416,9 +445,7 @@ public:
         else
         {
             std::cout << "Weird Case" << '\n';
-
-            // what do we do here if we dont become leader
-            // do we just let the election timeout?
+            state = FOLLOWER;
         }
 
         // should we be discovering a new current leader iin the other thread, or should we process that from the request vote call?
@@ -436,9 +463,11 @@ public:
 
                 // now i need to send append_entries heartbeat call right?
                 std::vector<LogEntry> empty_logs;
+                int prevLogIndex = get_last_log_index();
+                int prevLogTerm = get_last_log_term();
                 for (int i = 0; i < neighbors.size(); i++)
                 {
-                    append_entries(currentTerm, id, lastApplied, logs[lastApplied].termCommited, empty_logs, commitIndex);
+                    append_entries(currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
                 }
             }
             else if (state == FOLLOWER || state == CANDIDATE)
@@ -464,14 +493,14 @@ public:
                 if (applied == true)
                 {
                     // carry on as a follower
-                    break;
+                    continue;
                 }
                 else
                 {
                     std::cout << "Leader timed-out, starting election" << "\n";
                     // start an election
                     start_election();
-                    break;
+                    continue;
                 }
             }
         }
