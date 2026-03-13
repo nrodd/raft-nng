@@ -471,14 +471,15 @@ public:
         }
         std::cout << "Made it through loop" << '\n';
 
-        if (votedForCount >= neighbors.size() / 2 + 1)
+        int totalNodes = static_cast<int>(neighbors.size()) + 1; // include self
+        int majority = totalNodes / 2 + 1;
+
+        if (votedForCount >= majority)
         {
-            // this means we won the election, become leader
             convert_to_leader();
         }
         else
         {
-            std::cout << "Weird Case" << '\n';
             state = FOLLOWER;
         }
 
