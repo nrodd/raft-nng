@@ -8,8 +8,13 @@
 #include <random>
 #include <algorithm>
 #include <unordered_map>
+#include <cstring>
 
 // need to update persistent state to actually write to disk
+
+#define MAX_STR_LEN 64
+#define MAX_LOG_ENTRIES 16
+#define MAX_CMD_LEN 256
 
 enum StateType
 {
@@ -21,23 +26,24 @@ enum StateType
 struct LogEntry
 {
     int termCommited;
-    std::string command;
+    char command[MAX_CMD_LEN];
 };
 
 // we can probaby combine(prevLogIndex, prevLogTerm) with (lastLogIndex, lastLogTerm)
 struct RPCMessage
 {
-    int type;                           // 0 for append_entries, 1 for request_vote, 2 for client request
-    int term;                           // append_entries and request_vote
-    std::string leaderId;               // append_entries
-    int prevLogIndex;                   // append_entries
-    int prevLogTerm;                    // append_entries
-    std::vector<LogEntry> entries;      // append_entries
-    int leaderCommit;                   // append_entries
-    std::string candidateId;            // request_vote
-    int lastLogIndex;                   // request_vote
-    int lastLogTerm;                    // request_vote
-    std::string client_request_command; // client_request
+    int type;                                 // 0 for append_entries, 1 for request_vote, 2 for client request
+    int term;                                 // append_entries and request_vote
+    char leaderId[MAX_STR_LEN];               // append_entries
+    int prevLogIndex;                         // append_entries
+    int prevLogTerm;                          // append_entries
+    LogEntry entries[MAX_LOG_ENTRIES];        // append_entries
+    int numEntries;                           // append_entries
+    int leaderCommit;                         // append_entries
+    char candidateId[MAX_STR_LEN];            // request_vote
+    int lastLogIndex;                         // request_vote
+    int lastLogTerm;                          // request_vote
+    char client_request_command[MAX_CMD_LEN]; // client_request
 };
 
 // we can probably combine success and voteGranted
@@ -147,39 +153,40 @@ public:
 
             int temp_response = nng_recv(sock, &incoming_data, &incoming_data_size, 0);
 
-            if (temp_response == sizeof(incoming_data))
+            if (temp_response == 0 && incoming_data_size == sizeof(incoming_data))
             {
                 std::cout << "Incoming RPC type:" << incoming_data.type << "\n";
 
                 RPCMessageResponse reply_data;
+                std::vector<LogEntry> entries(incoming_data.entries, incoming_data.entries + incoming_data.numEntries);
 
                 if (incoming_data.type == 0)
                 {
                     // process append_entries
-                    auto [term, truthy] = process_append_entries(incoming_data.term, incoming_data.leaderId, incoming_data.prevLogIndex, incoming_data.prevLogTerm, incoming_data.entries, incoming_data.leaderCommit);
+                    auto [term, truthy] = process_append_entries(incoming_data.term, std::string(incoming_data.leaderId), incoming_data.prevLogIndex, incoming_data.prevLogTerm, entries, incoming_data.leaderCommit);
                     reply_data.success = truthy;
                     reply_data.term = term;
                 }
                 else if (incoming_data.type == 1)
                 {
                     // process request_vote
-                    auto [term, truthy] = process_request_vote(incoming_data.term, incoming_data.candidateId, incoming_data.lastLogIndex, incoming_data.lastLogTerm);
+                    auto [term, truthy] = process_request_vote(incoming_data.term, std::string(incoming_data.candidateId), incoming_data.lastLogIndex, incoming_data.lastLogTerm);
                     reply_data.voteGranted = truthy;
                     reply_data.term = term;
                 }
                 else if (incoming_data.type == 2)
                 {
                     // process client request
-                    process_client_request(incoming_data.client_request_command);
+                    process_client_request(std::string(incoming_data.client_request_command));
                 }
 
                 int reply_data_size = sizeof(reply_data);
                 nng_send(sock, &reply_data, reply_data_size, 0); // should we be sending this on socket? how do we know which to send it to?
             }
-            else if (temp_response == -1)
+            else if (temp_response != 0)
             {
                 // handle error
-                std::cout << "Error: Could not process incoming response" << "\n";
+                std::cout << "Error: Could not receive message: " << nng_strerror((nng_err)temp_response) << "\n";
                 break;
             }
             else
@@ -205,7 +212,8 @@ public:
             // 1. append entry to local log
             LogEntry newEntry;
             newEntry.termCommited = currentTerm;
-            newEntry.command = command;
+            strncpy(newEntry.command, command.c_str(), MAX_CMD_LEN - 1);
+            newEntry.command[MAX_CMD_LEN - 1] = '\0';
             logs.push_back(newEntry);
 
             // 2. send append_entries to all followers
@@ -363,12 +371,15 @@ public:
     {
         std::cout << "sending append_entries" << "\n";
         RPCMessage receiver_msg;
+        memset(&receiver_msg, 0, sizeof(receiver_msg));
         receiver_msg.type = 0;
         receiver_msg.term = term;
-        receiver_msg.leaderId = leaderId;
+        strncpy(receiver_msg.leaderId, leaderId.c_str(), MAX_STR_LEN - 1);
         receiver_msg.prevLogIndex = prevLogIndex;
         receiver_msg.prevLogTerm = prevLogTerm;
-        receiver_msg.entries = entries;
+        receiver_msg.numEntries = (int)entries.size();
+        for (int i = 0; i < (int)entries.size() && i < MAX_LOG_ENTRIES; i++)
+            receiver_msg.entries[i] = entries[i];
         receiver_msg.leaderCommit = leaderCommit;
 
         RPCMessageResponse receiver_response = send_message(peer, receiver_msg);
@@ -408,9 +419,10 @@ public:
     {
         std::cout << "requesting vote" << "\n";
         RPCMessage receiver_msg;
+        memset(&receiver_msg, 0, sizeof(receiver_msg));
         receiver_msg.type = 1;
         receiver_msg.term = term;
-        receiver_msg.candidateId = id;
+        strncpy(receiver_msg.candidateId, id.c_str(), MAX_STR_LEN - 1);
         receiver_msg.lastLogIndex = lastLogIndex;
         receiver_msg.lastLogTerm = lastLogTerm;
         RPCMessageResponse receiver_response = send_message(peer, receiver_msg);
