@@ -7,6 +7,7 @@
 #include <chrono>
 #include <random>
 #include <algorithm>
+#include <unordered_map>
 
 // need to update persistent state to actually write to disk
 
@@ -57,6 +58,7 @@ public:
     std::vector<std::string> neighbors; // persistent on the application level?
     int commitIndex = -1;               // volatile
     int lastApplied = -1;               // volatile
+    std::string gui_id = "";
 
     std::string id = "";
 
@@ -70,6 +72,7 @@ public:
     std::mutex applied_mutex;
 
     nng_socket sock;
+    std::unordered_map<std::string, nng_socket> peer_sockets;
 
     int get_last_log_index() const
     {
@@ -81,22 +84,31 @@ public:
         return logs.empty() ? 0 : logs.back().termCommited;
     }
 
-    RPCMessageResponse send_message(nng_socket sock, RPCMessage msg)
+    RPCMessageResponse send_message(const std::string &peer, RPCMessage msg)
     {
         RPCMessageResponse response_data{};
         response_data.error = 0;
+
+        auto it = peer_sockets.find(peer);
+        if (it == peer_sockets.end())
+        {
+            response_data.error = NNG_ENOENT;
+            return response_data;
+        }
+
+        nng_socket peer_sock = it->second;
 
         constexpr int kMaxRetries = 2;
         constexpr nng_duration kTimeoutMs = 100;
 
         // Per-call timeout (can also be set once in main)
-        nng_socket_set_ms(sock, NNG_OPT_SENDTIMEO, kTimeoutMs);
-        nng_socket_set_ms(sock, NNG_OPT_RECVTIMEO, kTimeoutMs);
+        nng_socket_set_ms(peer_sock, NNG_OPT_SENDTIMEO, kTimeoutMs);
+        nng_socket_set_ms(peer_sock, NNG_OPT_RECVTIMEO, kTimeoutMs);
 
         for (int attempt = 0; attempt <= kMaxRetries; ++attempt)
         {
             size_t data_size = sizeof(msg);
-            int rv = nng_send(sock, &msg, data_size, 0);
+            int rv = nng_send(peer_sock, &msg, data_size, 0);
             if (rv != 0)
             {
                 if (rv == NNG_ETIMEDOUT && attempt < kMaxRetries)
@@ -106,7 +118,7 @@ public:
             }
 
             size_t response_data_size = sizeof(response_data);
-            rv = nng_recv(sock, &response_data, &response_data_size, 0);
+            rv = nng_recv(peer_sock, &response_data, &response_data_size, 0);
 
             if (rv == 0 && response_data_size == sizeof(response_data))
             {
@@ -204,7 +216,7 @@ public:
             int successCount = 1; // count self
             for (int i = 0; i < neighbors.size(); i++)
             {
-                bool success = append_entries(currentTerm, id, prevLogIndex, prevLogTerm, newEntries, commitIndex);
+                bool success = append_entries(neighbors[i], currentTerm, id, prevLogIndex, prevLogTerm, newEntries, commitIndex);
                 if (success)
                 {
                     successCount++;
@@ -347,7 +359,7 @@ public:
 
 
     */
-    bool append_entries(int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
+    bool append_entries(const std::string &peer, int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
     {
         std::cout << "sending append_entries" << "\n";
         RPCMessage receiver_msg;
@@ -359,7 +371,7 @@ public:
         receiver_msg.entries = entries;
         receiver_msg.leaderCommit = leaderCommit;
 
-        RPCMessageResponse receiver_response = send_message(sock, receiver_msg);
+        RPCMessageResponse receiver_response = send_message(peer, receiver_msg);
         return receiver_response.success;
     };
 
@@ -374,7 +386,7 @@ public:
         int prevLogTerm = get_last_log_term();
         for (int i = 0; i < neighbors.size(); i++)
         {
-            append_entries(currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
+            append_entries(neighbors[i], currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
         }
     }
 
@@ -392,7 +404,7 @@ public:
     bool voteGranted -> true means candidate received vote
 
     */
-    bool request_vote(int term, std::string candidateId, int lastLogIndex, int lastLogTerm) // RPC
+    bool request_vote(const std::string &peer, int term, std::string candidateId, int lastLogIndex, int lastLogTerm) // RPC
     {
         std::cout << "requesting vote" << "\n";
         RPCMessage receiver_msg;
@@ -401,7 +413,7 @@ public:
         receiver_msg.candidateId = id;
         receiver_msg.lastLogIndex = lastLogIndex;
         receiver_msg.lastLogTerm = lastLogTerm;
-        RPCMessageResponse receiver_response = send_message(sock, receiver_msg);
+        RPCMessageResponse receiver_response = send_message(peer, receiver_msg);
         return receiver_response.voteGranted;
     };
 
@@ -425,10 +437,10 @@ public:
             // make request vote RPC call to each one
             std::cout << "Last Applied: " << lastApplied << '\n';
             std::cout << "Current Term: " << currentTerm << '\n';
-            std::cout << "ID: " << id << '\n';
+            std::cout << "ID: " << neighbors[i] << '\n';
             std::cout << "lastLogTerm: " << lastLogTerm << '\n';
 
-            bool resp = request_vote(currentTerm, id, lastLogIndex, lastLogTerm);
+            bool resp = request_vote(neighbors[i], currentTerm, id, lastLogIndex, lastLogTerm);
             std::cout << "After request vote" << '\n';
             if (resp == true)
             {
@@ -467,7 +479,7 @@ public:
                 int prevLogTerm = get_last_log_term();
                 for (int i = 0; i < neighbors.size(); i++)
                 {
-                    append_entries(currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
+                    append_entries(neighbors[i], currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
                 }
             }
             else if (state == FOLLOWER || state == CANDIDATE)
@@ -554,13 +566,23 @@ int main()
         std::remove(myServer.neighbors.begin(), myServer.neighbors.end(), url),
         myServer.neighbors.end());
 
-    // dial each neighbor
+    // create a dedicated outbound socket per neighbor
     for (auto &neighbor : myServer.neighbors)
     {
-        if ((rv = nng_dial(sock, neighbor.c_str(), nullptr, NNG_FLAG_NONBLOCK)) != 0)
+        nng_socket peer_sock;
+        if ((rv = nng_bus0_open(&peer_sock)) != 0)
+        {
+            std::cerr << "Failed to open outbound socket for " << neighbor << ": " << nng_strerror((nng_err)rv) << "\n";
+            continue;
+        }
+
+        if ((rv = nng_dial(peer_sock, neighbor.c_str(), nullptr, NNG_FLAG_NONBLOCK)) != 0)
         {
             std::cerr << "Failed to dial " << neighbor << ": " << nng_strerror((nng_err)rv) << "\n";
+            continue;
         }
+
+        myServer.peer_sockets[neighbor] = peer_sock;
     }
 
     myServer.sock = sock;
