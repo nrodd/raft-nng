@@ -153,12 +153,28 @@ public:
 
             int temp_response = nng_recv(sock, &incoming_data, &incoming_data_size, 0);
 
-            if (temp_response == 0 && incoming_data_size == sizeof(incoming_data))
+            if (temp_response == 0)
             {
+                // This socket can receive different frame types (RPC requests and replies).
+                // Only parse full RPCMessage frames here; skip others.
+                if (incoming_data_size != sizeof(incoming_data))
+                {
+                    if (incoming_data_size == sizeof(RPCMessageResponse))
+                    {
+                        // Reply frame consumed on listener socket; ignore.
+                        continue;
+                    }
+
+                    std::cout << "Warning: Unexpected frame size " << incoming_data_size
+                              << " (expected " << sizeof(incoming_data) << ")\n";
+                    continue;
+                }
+
                 std::cout << "Incoming RPC type:" << incoming_data.type << "\n";
 
-                RPCMessageResponse reply_data;
-                std::vector<LogEntry> entries(incoming_data.entries, incoming_data.entries + incoming_data.numEntries);
+                RPCMessageResponse reply_data{};
+                int safeNumEntries = std::max(0, std::min(incoming_data.numEntries, MAX_LOG_ENTRIES));
+                std::vector<LogEntry> entries(incoming_data.entries, incoming_data.entries + safeNumEntries);
 
                 if (incoming_data.type == 0)
                 {
@@ -187,12 +203,6 @@ public:
             {
                 // handle error
                 std::cout << "Error: Could not receive message: " << nng_strerror((nng_err)temp_response) << "\n";
-                break;
-            }
-            else
-            {
-                // handle error for incorrect size
-                std::cout << "Error: Incoming size does not match expectations" << "\n";
                 break;
             }
         }
