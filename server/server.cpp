@@ -528,7 +528,7 @@ void fatal(const char *func, int rv)
 int main()
 {
 
-    char *url = "tcp://127.0.0.1:5555";
+    char *url = "tcp://192.168.1.82";
 
     Server myServer;
     myServer.id = url;
@@ -557,10 +557,8 @@ int main()
 
     // set neighbors to the other servers' addresses
     myServer.neighbors = {
-        "tcp://127.0.0.1:5001",
-        "tcp://127.0.0.1:5002",
-        "tcp://127.0.0.1:5003",
-        "tcp://127.0.0.1:5004"};
+        "tcp://192.168.1.82",
+        "tcp://192.168.1.83"};
     // remove self from neighbors
     myServer.neighbors.erase(
         std::remove(myServer.neighbors.begin(), myServer.neighbors.end(), url),
