@@ -23,10 +23,32 @@ enum StateType
     CANDIDATE
 };
 
+const char *state_to_string(StateType state)
+{
+    switch (state)
+    {
+    case LEADER:
+        return "leader";
+    case FOLLOWER:
+        return "follower";
+    case CANDIDATE:
+        return "candidate";
+    }
+
+    return "unknown";
+}
+
 struct LogEntry
 {
     int termCommited;
     char command[MAX_CMD_LEN];
+};
+
+struct GUIMessage
+{
+    char id[MAX_STR_LEN];   // append_entries
+    char role[MAX_STR_LEN]; // append_entries
+    int term;
 };
 
 // we can probaby combine(prevLogIndex, prevLogTerm) with (lastLogIndex, lastLogTerm)
@@ -58,39 +80,119 @@ struct RPCMessageResponse
 class Server
 {
 public:
+    // node info
     int currentTerm = 0;                // persistent
     std::string votedFor = "";          // persistent
     std::vector<LogEntry> logs;         // persistent log[0] -> (term_received, command)
     std::vector<std::string> neighbors; // persistent on the application level?
     int commitIndex = -1;               // volatile
     int lastApplied = -1;               // volatile
-    std::string gui_id = "";
-
     std::string id = "";
 
-    // state stuff
+    // state
     StateType state = FOLLOWER;
 
-    // thread stuff
+    // threading
     bool running = false;
-
     bool applied = false;
     std::mutex applied_mutex;
+    std::mutex state_mutex;
 
+    // connections
     nng_socket sock;
     std::unordered_map<std::string, nng_socket> peer_sockets;
 
+    // gui info
+    std::string gui_id = "tcp://127.0.0.1:5200";
+    nng_socket gui_sock;
+
+    /*
+    used to safely get index of last log stored
+
+    args:
+    n/a
+
+    rets:
+    int -> index of last log
+    */
     int get_last_log_index() const
     {
         return logs.empty() ? -1 : static_cast<int>(logs.size()) - 1;
     }
 
+    /*
+    used to safely get election term of last indexed log
+
+    args:
+    n/a
+
+    rets:
+    int -> election term of last indexed log
+    */
     int get_last_log_term() const
     {
         return logs.empty() ? 0 : logs.back().termCommited;
     }
 
-    RPCMessageResponse send_message(const std::string &peer, RPCMessage msg)
+    /*
+    sends message to GUI endpoint, doesn't look for a response
+
+    args:
+    const GUIMessage &msg: address of message to be sent to GUI
+
+    rets:
+    n/a
+    */
+    void send_gui_message(const GUIMessage &msg)
+    {
+        std::cout << "Sending message to gui" << '\n';
+        constexpr nng_duration kTimeoutMs = 100;
+
+        // Per-call timeout (can also be set once in main)
+        nng_socket_set_ms(gui_sock, NNG_OPT_SENDTIMEO, kTimeoutMs);
+
+        size_t data_size = sizeof(msg);
+        GUIMessage copy = msg;
+        int rv = nng_send(gui_sock, &copy, data_size, 0);
+        if (rv != 0)
+        {
+            std::cout << "Sending to GUI failed: " << nng_strerror((nng_err)rv) << '\n';
+            return;
+        }
+        std::cout << "Sending message to gui passed" << '\n';
+    }
+
+    /*
+    invokes the send_gui_message function, retreives status args
+
+    args:
+    n/a
+
+    rets:
+    n/a
+    */
+    void send_gui_status()
+    {
+        GUIMessage msg{};
+        strncpy(msg.id, id.c_str(), MAX_STR_LEN - 1);
+        strncpy(msg.role, state_to_string(state), MAX_STR_LEN - 1);
+        msg.term = currentTerm;
+        send_gui_message(msg);
+    }
+
+    /*
+    sends messages to peer endpoint and returns the response. has a
+    configurable timeout / retry parameter.
+
+
+    args:
+    const string &msg: address of peer id
+    msg: message to be sent to peer id endpoint
+
+    rets:
+    RPCMessageResponse -> message response from peer or error
+    */
+    RPCMessageResponse send_message(const std::string &peer, RPCMessage msg, int maxRetries = 2, nng_duration timeoutMs = 100)
     {
         RPCMessageResponse response_data{};
         response_data.error = 0;
@@ -104,20 +206,17 @@ public:
 
         nng_socket peer_sock = it->second;
 
-        constexpr int kMaxRetries = 2;
-        constexpr nng_duration kTimeoutMs = 100;
-
         // Per-call timeout (can also be set once in main)
-        nng_socket_set_ms(peer_sock, NNG_OPT_SENDTIMEO, kTimeoutMs);
-        nng_socket_set_ms(peer_sock, NNG_OPT_RECVTIMEO, kTimeoutMs);
+        nng_socket_set_ms(peer_sock, NNG_OPT_SENDTIMEO, timeoutMs);
+        nng_socket_set_ms(peer_sock, NNG_OPT_RECVTIMEO, timeoutMs);
 
-        for (int attempt = 0; attempt <= kMaxRetries; ++attempt)
+        for (int attempt = 0; attempt <= maxRetries; ++attempt)
         {
             size_t data_size = sizeof(msg);
             int rv = nng_send(peer_sock, &msg, data_size, 0);
             if (rv != 0)
             {
-                if (rv == NNG_ETIMEDOUT && attempt < kMaxRetries)
+                if (rv == NNG_ETIMEDOUT && attempt < maxRetries)
                     continue;
                 response_data.error = rv;
                 return response_data;
@@ -131,7 +230,7 @@ public:
                 return response_data; // success
             }
 
-            if (rv == NNG_ETIMEDOUT && attempt < kMaxRetries)
+            if (rv == NNG_ETIMEDOUT && attempt < maxRetries)
             {
                 continue; // retry same peer
             }
@@ -144,6 +243,16 @@ public:
         return response_data;
     }
 
+    /*
+    receives messages from peers and instructinons from gui, then dispatches associated
+    functions
+
+    args:
+    nng_socket sock: socket that this thread will run on and receive messages
+
+    rets:
+    n/a
+    */
     void receive_message_thread(nng_socket sock)
     {
         while (running)
@@ -258,15 +367,21 @@ public:
 
     std::pair<int, bool> process_append_entries(int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
     {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        send_gui_status();
         // set our applied var to true so that the follower doesnt time out
         applied_helper_function(true);
 
-        // do we need to process hearbeats any differently?
-
-        // If AppendEntries RPC received from new leader: convert to follower
-        if (state == CANDIDATE)
+        // If we see a higher term, step down immediately (covers leader, candidate, and follower)
+        if (term > currentTerm)
         {
-            // convert to follower
+            currentTerm = term;
+            votedFor = "";
+            state = FOLLOWER;
+        }
+        // If AppendEntries RPC received from new leader in same term: convert candidate to follower
+        else if (state == CANDIDATE && term == currentTerm)
+        {
             state = FOLLOWER;
         }
 
@@ -296,9 +411,10 @@ public:
         for (int i = 0; i < entries.size(); i++)
         {
             int logIndex = prevLogIndex + 1 + i;
-            if (logIndex < logs.size() && logs[logIndex].termCommited != term)
+            if (logIndex < static_cast<int>(logs.size()) && logs[logIndex].termCommited != entries[i].termCommited)
             {
                 logs.erase(logs.begin() + logIndex, logs.end());
+                break;
             }
         }
 
@@ -324,6 +440,8 @@ public:
 
     std::pair<int, bool> process_request_vote(int term, std::string candidateId, int lastLogIndex, int lastLogTerm) // RPC
     {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        send_gui_status();
         //  1. Reply false if term < currentTerm (§5.1)
         if (term < currentTerm)
         {
@@ -348,6 +466,7 @@ public:
         if ((votedFor.empty() || votedFor == candidateId) && logIsUpToDate)
         {
             votedFor = candidateId;
+            applied_helper_function(true); // reset election timer on vote grant
             return {currentTerm, true};
         }
         return {currentTerm, false};
@@ -379,6 +498,8 @@ public:
     */
     bool append_entries(const std::string &peer, int term, std::string leaderId, int prevLogIndex, int prevLogTerm, std::vector<LogEntry> entries, int leaderCommit) // RPC
     {
+        send_gui_status();
+
         std::cout << "sending append_entries" << "\n";
         RPCMessage receiver_msg;
         memset(&receiver_msg, 0, sizeof(receiver_msg));
@@ -392,7 +513,15 @@ public:
             receiver_msg.entries[i] = entries[i];
         receiver_msg.leaderCommit = leaderCommit;
 
-        RPCMessageResponse receiver_response = send_message(peer, receiver_msg);
+        // No retries — leader retries naturally via periodic heartbeats
+        RPCMessageResponse receiver_response = send_message(peer, receiver_msg, 0, 50);
+
+        if (receiver_response.error == 0 && receiver_response.term > currentTerm)
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            convert_to_follower(receiver_response.term);
+        }
+
         return receiver_response.success;
     };
 
@@ -409,6 +538,13 @@ public:
         {
             append_entries(neighbors[i], currentTerm, id, prevLogIndex, prevLogTerm, empty_logs, commitIndex);
         }
+    }
+
+    void convert_to_follower(int newTerm)
+    {
+        currentTerm = newTerm;
+        votedFor = "";
+        state = FOLLOWER;
     }
 
     /*
@@ -435,7 +571,15 @@ public:
         strncpy(receiver_msg.candidateId, id.c_str(), MAX_STR_LEN - 1);
         receiver_msg.lastLogIndex = lastLogIndex;
         receiver_msg.lastLogTerm = lastLogTerm;
-        RPCMessageResponse receiver_response = send_message(peer, receiver_msg);
+        // No retries for vote requests — dead peers should fail fast
+        RPCMessageResponse receiver_response = send_message(peer, receiver_msg, 0, 50);
+
+        if (receiver_response.error == 0 && receiver_response.term > currentTerm)
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            convert_to_follower(receiver_response.term);
+        }
+
         return receiver_response.voteGranted;
     };
 
@@ -443,10 +587,14 @@ public:
     {
         std::cout << "Start Election called" << '\n';
 
-        state = CANDIDATE;
-        votedFor = id;
-        currentTerm++;
-        // reset election timer
+        {
+            std::lock_guard<std::mutex> lock(state_mutex);
+            state = CANDIDATE;
+            votedFor = id;
+            currentTerm++;
+        }
+
+        send_gui_status();
 
         int votedForCount = 1; // vote for self i think
         int lastLogIndex = get_last_log_index();
@@ -454,6 +602,13 @@ public:
         // will have to change this to run in parallel in future
         for (int i = 0; i < neighbors.size(); i++)
         {
+            // If we were stepped down by an RPC response, abort the election
+            if (state != CANDIDATE)
+            {
+                std::cout << "Stepped down during election, aborting" << '\n';
+                return;
+            }
+
             std::cout << "In loop" << '\n';
 
             // make request vote RPC call to each one
@@ -474,13 +629,23 @@ public:
         int totalNodes = static_cast<int>(neighbors.size()) + 1; // include self
         int majority = totalNodes / 2 + 1;
 
-        if (votedForCount >= majority)
         {
-            convert_to_leader();
-        }
-        else
-        {
-            state = FOLLOWER;
+            std::lock_guard<std::mutex> lock(state_mutex);
+            // Final check: only become leader if still a candidate
+            if (state != CANDIDATE)
+            {
+                std::cout << "Stepped down before leader conversion, aborting" << '\n';
+                return;
+            }
+
+            if (votedForCount >= majority)
+            {
+                convert_to_leader();
+            }
+            else
+            {
+                state = FOLLOWER;
+            }
         }
 
         // should we be discovering a new current leader iin the other thread, or should we process that from the request vote call?
@@ -548,10 +713,16 @@ void fatal(const char *func, int rv)
     exit(1);
 }
 
-int main()
+int main(int argc, char *argv[])
 {
+    if (argc < 2)
+    {
+        std::cerr << "Usage: " << argv[0] << " <ip-address>" << std::endl;
+        return 1;
+    }
 
-    char *url = "tcp://192.168.1.82:5000";
+    std::string ip_address = argv[1];
+    std::string url = "tcp://" + ip_address;
 
     Server myServer;
     myServer.id = url;
@@ -571,7 +742,7 @@ int main()
     }
 
     nng_listener listener;
-    if ((rv = nng_listener_create(&listener, sock, url)) != 0)
+    if ((rv = nng_listener_create(&listener, sock, url.c_str())) != 0)
         fatal("nng_listener_create", rv);
     if ((rv = nng_listener_start(listener, 0)) != 0)
         fatal("nng_listener_start", rv);
@@ -580,8 +751,11 @@ int main()
 
     // set neighbors to the other servers' addresses
     myServer.neighbors = {
-        "tcp://192.168.1.82:5000",
-        "tcp://192.168.1.83:5000"};
+        "tcp://127.0.0.1:5000",
+        "tcp://127.0.0.1:5001",
+        "tcp://127.0.0.1:5002",
+        "tcp://127.0.0.1:5003",
+        "tcp://127.0.0.1:5004"};
     // remove self from neighbors
     myServer.neighbors.erase(
         std::remove(myServer.neighbors.begin(), myServer.neighbors.end(), url),
@@ -605,6 +779,20 @@ int main()
 
         myServer.peer_sockets[neighbor] = peer_sock;
     }
+
+    // start gui publisher socket (GUI side is SUB)
+    nng_socket gui_sock;
+    if ((rv = nng_pub0_open(&gui_sock)) != 0)
+    {
+        std::cerr << "Failed to open outbound pub socket for gui: " << nng_strerror((nng_err)rv) << "\n";
+    }
+
+    if ((rv = nng_dial(gui_sock, myServer.gui_id.c_str(), nullptr, NNG_FLAG_NONBLOCK)) != 0)
+    {
+        std::cerr << "Failed to dial gui : " << nng_strerror((nng_err)rv) << "\n";
+    }
+
+    myServer.gui_sock = gui_sock;
 
     myServer.sock = sock;
     myServer.running = true;
